@@ -8,8 +8,8 @@ import (
 	"math"
 	"time"
 
-	"github.com/google/uuid"
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/PeerDB-io/peerdb/flow/connectors/utils"
@@ -38,6 +38,10 @@ func (c *MongoConnector) GetQRepPartitions(
 		return fullTablePartition, nil
 	}
 
+	if config.WatermarkColumn != DefaultDocumentKeyColumnName {
+		return nil, fmt.Errorf("only %s is currently supported as watermark column for MongoDB connector", DefaultDocumentKeyColumnName)
+	}
+
 	if config.NumRowsPerPartition <= 0 {
 		return nil, fmt.Errorf("num rows per partition must be greater than 0")
 	} else if last != nil && last.Range != nil {
@@ -58,9 +62,6 @@ func (c *MongoConnector) GetQRepPartitions(
 	if err != nil {
 		return nil, fmt.Errorf("failed to count documents in collection %s: %w", parseWatermarkTable.Table, err)
 	}
-	if totalRows == 0 {
-		return []*protos.QRepPartition{}, nil
-	}
 
 	// Calculate the number of partitions
 	adjustedPartitions := shared.AdjustNumPartitions(totalRows, numRowsPerPartition)
@@ -70,78 +71,50 @@ func (c *MongoConnector) GetQRepPartitions(
 		slog.Int64("adjustedNumPartitions", adjustedPartitions.AdjustedNumPartitions),
 		slog.Int64("adjustedNumRowsPerPartition", adjustedPartitions.AdjustedNumRowsPerPartition))
 
-	// no need to bother with bucketAuto if we have only one partition
-	if adjustedPartitions.AdjustedNumPartitions == 1 {
-		return fullTablePartition, nil
-	}
-
-	if config.WatermarkColumn != DefaultDocumentKeyColumnName {
-		return nil, fmt.Errorf("only %s is currently supported as watermark column for MongoDB connector", DefaultDocumentKeyColumnName)
-	}
-
-	// Use bucketAuto to create partitions based on _id field
-	bucketAutoPipeline := []bson.D{
-		{
-			{Key: "$bucketAuto", Value: bson.D{
-				{Key: "groupBy", Value: "$" + config.WatermarkColumn},
-				{Key: "buckets", Value: adjustedPartitions.AdjustedNumPartitions},
-			}},
-		},
-	}
-
-	cursor, err := collection.Aggregate(ctx, bucketAutoPipeline)
-	if err != nil {
-		return nil, fmt.Errorf("failed to aggregate for bucket partitions: %w", err)
-	}
-	defer cursor.Close(ctx)
-
-	partitions := make([]*protos.QRepPartition, 0, adjustedPartitions.AdjustedNumPartitions)
-	for cursor.Next(ctx) {
-		var bucket struct {
-			ID struct {
-				Min bson.ObjectID `bson:"min"`
-				Max bson.ObjectID `bson:"max"`
-			} `bson:"_id"`
-		}
-		if err := bson.Unmarshal(cursor.Current, &bucket); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal bucket: %w", err)
-		}
-
-		partitions = append(partitions, &protos.QRepPartition{
-			PartitionId: uuid.NewString(),
-			Range: &protos.PartitionRange{
-				Range: &protos.PartitionRange_ObjectIdRange{
-					ObjectIdRange: &protos.ObjectIdPartitionRange{
-						Start: bucket.ID.Min.Hex(),
-						End:   bucket.ID.Max.Hex(),
-					},
-				},
-			},
-			FullTablePartition: false,
-		})
-	}
-	if err := cursor.Err(); err != nil {
-		if errors.Is(err, context.Canceled) {
-			c.logger.Warn("context canceled while performing bucketAuto aggregation",
-				slog.String("watermark_table", config.WatermarkTable))
-		} else {
-			c.logger.Error("error while performing bucketAuto aggregation",
-				slog.String("watermark_table", config.WatermarkTable),
-				slog.String("error", err.Error()))
-		}
-		return nil, fmt.Errorf("cursor error during bucketAuto aggregation: %w", err)
-	}
-
-	return partitions, nil
+	return c.minMaxPartitions(ctx, collection, adjustedPartitions.AdjustedNumPartitions)
 }
 
 func (c *MongoConnector) GetDefaultPartitionKeyForTables(
 	ctx context.Context,
 	input *protos.GetDefaultPartitionKeyForTablesInput,
 ) (*protos.GetDefaultPartitionKeyForTablesOutput, error) {
+	mapping := make(map[string]string, len(input.TableMappings))
+	for _, tm := range input.TableMappings {
+		parsedTable, err := common.ParseTableIdentifier(tm.SourceTableIdentifier)
+		if err != nil {
+			c.logger.Warn("[mongo] failed to parse table identifier, skipping parallel load",
+				slog.String("table", tm.SourceTableIdentifier),
+				slog.String("error", err.Error()))
+			continue
+		}
+		collection := c.client.Database(parsedTable.Namespace).Collection(parsedTable.Table)
+		if hasObjectIDAsKey(ctx, collection) {
+			mapping[tm.SourceTableIdentifier] = DefaultDocumentKeyColumnName
+		} else {
+			c.logger.Info("[mongo] _id is not ObjectID type, falling back to full table partition",
+				slog.String("table", tm.SourceTableIdentifier))
+		}
+	}
 	return &protos.GetDefaultPartitionKeyForTablesOutput{
-		TableDefaultPartitionKeyMapping: nil,
+		TableDefaultPartitionKeyMapping: mapping,
 	}, nil
+}
+
+func hasObjectIDAsKey(ctx context.Context, collection *mongo.Collection) bool {
+	cursor, err := collection.Find(ctx, bson.D{}, options.Find().SetLimit(1).SetProjection(bson.D{{Key: DefaultDocumentKeyColumnName, Value: 1}}))
+	if err != nil {
+		return false
+	}
+	defer cursor.Close(ctx)
+
+	if !cursor.Next(ctx) {
+		return false
+	}
+	var oid bson.ObjectID
+	if err := bson.Unmarshal(cursor.Current, &oid); err != nil {
+		return false
+	}
+	return !oid.IsZero()
 }
 
 func (c *MongoConnector) PullQRepRecords(
