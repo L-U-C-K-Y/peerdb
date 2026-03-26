@@ -110,11 +110,13 @@ func hasObjectIDAsKey(ctx context.Context, collection *mongo.Collection) bool {
 	if !cursor.Next(ctx) {
 		return false
 	}
-	var oid bson.ObjectID
-	if err := bson.Unmarshal(cursor.Current, &oid); err != nil {
+	var doc struct {
+		ID bson.ObjectID `bson:"_id"`
+	}
+	if err := bson.Unmarshal(cursor.Current, &doc); err != nil {
 		return false
 	}
-	return !oid.IsZero()
+	return !doc.ID.IsZero()
 }
 
 func (c *MongoConnector) PullQRepRecords(

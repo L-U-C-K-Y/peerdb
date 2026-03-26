@@ -19,6 +19,7 @@ import (
 	connclickhouse "github.com/PeerDB-io/peerdb/flow/connectors/clickhouse"
 	"github.com/PeerDB-io/peerdb/flow/e2eshared"
 	"github.com/PeerDB-io/peerdb/flow/generated/protos"
+	"github.com/PeerDB-io/peerdb/flow/internal"
 	"github.com/PeerDB-io/peerdb/flow/model"
 	"github.com/PeerDB-io/peerdb/flow/shared"
 )
@@ -107,36 +108,95 @@ func (s MongoClickhouseSuite) Test_Simple_Flow_Partitioned() {
 	}
 	flowConnConfig := s.generateFlowConnectionConfigsDefaultEnv(connectionGen)
 	flowConnConfig.DoInitialSnapshot = true
-	flowConnConfig.TableMappings[0].PartitionKey = "_id"
 	flowConnConfig.SnapshotNumRowsPerPartition = 10
 
 	adminClient := s.Source().(*MongoSource).AdminClient()
 	collection := adminClient.Database(srcDatabase).Collection(srcTable)
-	// insert 1000 rows into the source table for initial load
+
+	baseTime := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	docs := make([]any, 1000)
 	for i := range 1000 {
-		testKey := fmt.Sprintf("init_key_%d", i)
-		testValue := fmt.Sprintf("init_value_%d", i)
-		res, err := collection.InsertOne(t.Context(), bson.D{bson.E{Key: testKey, Value: testValue}}, options.InsertOne())
-		require.NoError(t, err)
-		require.True(t, res.Acknowledged)
+		oid := bson.NewObjectIDFromTimestamp(baseTime.Add(time.Duration(i) * time.Second))
+		docs[i] = bson.D{
+			{Key: "_id", Value: oid},
+			{Key: fmt.Sprintf("init_key_%d", i), Value: fmt.Sprintf("init_value_%d", i)},
+		}
 	}
+	_, err := collection.InsertMany(t.Context(), docs)
+	require.NoError(t, err)
 
 	tc := NewTemporalClient(t)
 	env := ExecutePeerflow(t, tc, flowConnConfig)
 
 	EnvWaitForEqualTablesWithNames(env, s, "initial load to match", srcTable, dstTable, "_id,doc")
 
+	catalogPool, err := internal.GetCatalogConnectionPoolFromEnv(t.Context())
+	require.NoError(t, err)
+	var partitionCount int
+	require.NoError(t, catalogPool.QueryRow(t.Context(),
+		`SELECT COUNT(*) FROM peerdb_stats.qrep_partitions WHERE parent_mirror_name = $1`,
+		flowConnConfig.FlowJobName).Scan(&partitionCount))
+	require.Equal(t, 100, partitionCount, "expected 100 partitions for 1000 rows with 10 rows per partition")
+
 	SetupCDCFlowStatusQuery(t, env, flowConnConfig)
-	// insert 10 rows into the source table for cdc
+	cdcBaseTime := time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
+	cdcDocs := make([]any, 10)
 	for i := range 10 {
-		testKey := fmt.Sprintf("test_key_%d", i)
-		testValue := fmt.Sprintf("test_value_%d", i)
-		res, err := collection.InsertOne(t.Context(), bson.D{bson.E{Key: testKey, Value: testValue}}, options.InsertOne())
-		require.NoError(t, err)
-		require.True(t, res.Acknowledged)
+		oid := bson.NewObjectIDFromTimestamp(cdcBaseTime.Add(time.Duration(i) * time.Second))
+		cdcDocs[i] = bson.D{
+			{Key: "_id", Value: oid},
+			{Key: fmt.Sprintf("cdc_key_%d", i), Value: fmt.Sprintf("cdc_value_%d", i)},
+		}
 	}
+	_, err = collection.InsertMany(t.Context(), cdcDocs)
+	require.NoError(t, err)
 
 	EnvWaitForEqualTablesWithNames(env, s, "cdc events to match", srcTable, dstTable, "_id,doc")
+	env.Cancel(t.Context())
+	RequireEnvCanceled(t, env)
+}
+
+func (s MongoClickhouseSuite) Test_Snapshot_Non_ObjectID_Falls_Back_To_Single_Partition() {
+	t := s.T()
+	srcDatabase := GetTestDatabase(s.Suffix())
+	srcTable := "test_non_objectid_snapshot"
+	dstTable := "test_non_objectid_snapshot_dst"
+
+	connectionGen := FlowConnectionGenerationConfig{
+		FlowJobName:   AddSuffix(s, srcTable),
+		TableMappings: TableMappings(s, srcTable, dstTable),
+		Destination:   s.Peer().Name,
+	}
+	flowConnConfig := s.generateFlowConnectionConfigsDefaultEnv(connectionGen)
+	flowConnConfig.DoInitialSnapshot = true
+	flowConnConfig.SnapshotNumRowsPerPartition = 5
+
+	adminClient := s.Source().(*MongoSource).AdminClient()
+	collection := adminClient.Database(srcDatabase).Collection(srcTable)
+
+	docs := make([]any, 10)
+	for i := range 10 {
+		docs[i] = bson.D{
+			{Key: "_id", Value: fmt.Sprintf("string_id_%d", i)},
+			{Key: "value", Value: fmt.Sprintf("value_%d", i)},
+		}
+	}
+	_, err := collection.InsertMany(t.Context(), docs)
+	require.NoError(t, err)
+
+	tc := NewTemporalClient(t)
+	env := ExecutePeerflow(t, tc, flowConnConfig)
+
+	EnvWaitForEqualTablesWithNames(env, s, "initial load", srcTable, dstTable, "_id,doc")
+
+	catalogPool, err := internal.GetCatalogConnectionPoolFromEnv(t.Context())
+	require.NoError(t, err)
+	var partitionCount int
+	require.NoError(t, catalogPool.QueryRow(t.Context(),
+		`SELECT COUNT(*) FROM peerdb_stats.qrep_partitions WHERE parent_mirror_name = $1`,
+		flowConnConfig.FlowJobName).Scan(&partitionCount))
+	require.Equal(t, 1, partitionCount)
+
 	env.Cancel(t.Context())
 	RequireEnvCanceled(t, env)
 }
