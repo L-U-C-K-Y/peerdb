@@ -140,20 +140,17 @@ func (c *PostgresConnector) getReplicaIdentityType(
 }
 
 // getUniqueColumns returns the unique columns (used to select in MERGE statement) for a given table.
-// For replica identity 'd'/default, these are the primary key columns
-// For replica identity 'i'/index, these are the columns in the selected index (indisreplident set)
-// For replica identity 'f'/full, if there is a primary key we use that, else we return all columns
+// For all replica identity types, we prefer the primary key if it exists, since the MERGE ON clause
+// and PARTITION BY must match the destination table's actual unique constraint.
+// For replica identity 'i'/index, we fall back to the index columns only if no primary key exists.
+// For replica identity 'f'/full, if there is a primary key we use that, else we return all columns.
 func (c *PostgresConnector) getUniqueColumns(
 	ctx context.Context,
 	relID uint32,
 	replicaIdentity ReplicaIdentityType,
 	schemaTable *common.QualifiedTable,
 ) ([]string, error) {
-	if replicaIdentity == ReplicaIdentityIndex {
-		return c.getReplicaIdentityIndexColumns(ctx, relID, schemaTable)
-	}
-
-	// Find the primary key index OID, for replica identity 'd'/default or 'f'/full
+	// Find the primary key index OID
 	var pkIndexOID uint32
 	err := c.conn.QueryRow(ctx,
 		`SELECT indexrelid FROM pg_index WHERE indrelid = $1 AND indisprimary`,
@@ -161,6 +158,10 @@ func (c *PostgresConnector) getUniqueColumns(
 	if err != nil {
 		// don't error out if no pkey index, this would happen in EnsurePullability or UI.
 		if errors.Is(err, pgx.ErrNoRows) {
+			// No primary key — for replica identity index, fall back to the index columns
+			if replicaIdentity == ReplicaIdentityIndex {
+				return c.getReplicaIdentityIndexColumns(ctx, relID, schemaTable)
+			}
 			return []string{}, nil
 		}
 		return nil, fmt.Errorf("error finding primary key index for table %s: %w", schemaTable, err)
